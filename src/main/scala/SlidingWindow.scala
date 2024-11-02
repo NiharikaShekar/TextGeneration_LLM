@@ -11,21 +11,40 @@ import org.deeplearning4j.optimize.listeners.ScoreIterationListener
 import org.nd4j.linalg.activations.Activation
 import org.nd4j.linalg.dataset.DataSet
 import org.nd4j.linalg.factory.Nd4j
+import org.nd4j.linalg.ops.transforms.Transforms
 import org.nd4j.linalg.learning.config.Adam
 import org.nd4j.linalg.lossfunctions.LossFunctions
-import org.nd4j.linalg.api.ndarray.INDArray  // Added this import
-import org.nd4j.linalg.indexing.NDArrayIndex
+import org.nd4j.linalg.api.ndarray.INDArray
 import org.deeplearning4j.util.ModelSerializer
-import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.{ArrayBuffer, Set => MutableSet}
 import scala.util.Random
+import scala.util.Try
 import java.io.File
-import org.nd4j.linalg.ops.transforms.Transforms
 
 object SlidingWindow {
   // Constants
-  val embeddingSize = 64
+  val embeddingSize = 512
   val windowSize = 3
   val batchSize = 32
+  val hiddenSize = 128
+  val numEpochs = 10
+
+  // Hardcoded paths and input text
+  val embeddingsPath = "/Users/niharikabelavadishekar/Documents/Cloud_Assignment/Homework2_LLM/src/main/resources/input/part-r-00000"
+  val vocabularyPath = "/Users/niharikabelavadishekar/Documents/Cloud_Assignment/Homework2_LLM/src/main/resources/input/vocabulary.txt"
+  val inputText = "the city lights"
+
+  def loadVocabulary(path: String): Seq[String] = {
+    Try {
+      scala.io.Source.fromFile(path).getLines()
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .toSeq
+    }.getOrElse {
+      println(s"Error loading vocabulary from $path. Using default vocabulary.")
+      Seq("the", "city", "lights")
+    }
+  }
 
   def computePositionalEmbedding(windowSize: Int, embeddingDim: Int): Array[Vector] = {
     val positionalEncodings = new Array[Vector](windowSize)
@@ -44,28 +63,20 @@ object SlidingWindow {
   }
 
   def selfAttention(input: INDArray): INDArray = {
-    // Get dimensions
     val shape = input.shape()
     val batchSize = shape(0).toInt
     val sequenceLength = shape(1).toInt
     val embedSize = shape(2).toInt
 
-    // Create query, key, and value matrices
     val query = input.dup()
     val key = input.dup()
     val value = input.dup()
 
-    // Transpose key for matrix multiplication
     val keyTransposed = key.permute(0, 2, 1)
-
-    // Compute attention scores
     val scores = Nd4j.matmul(query, keyTransposed)
       .div(math.sqrt(embedSize))
 
-    // Apply softmax
     val attentionWeights = Transforms.softmax(scores)
-
-    // Compute weighted sum
     Nd4j.matmul(attentionWeights, value)
   }
 
@@ -100,14 +111,54 @@ object SlidingWindow {
     model
   }
 
-  def generateText(model: MultiLayerNetwork, df: DataFrame, seedTokens: Array[Row], numWords: Int, temperature: Double = 0.7): Seq[String] = {
-    val embeddingDim = seedTokens.head.getAs[Vector]("embedding").size
+  def preprocessInput(input: String, df: DataFrame): Array[Row] = {
+    val words = input.toLowerCase.split("\\s+")
+    words.map { word =>
+      try {
+        df.filter(df("word") === word).head
+      } catch {
+        case e: Exception =>
+          println(s"Warning: Word '$word' not found in vocabulary, using random word instead")
+          df.take(1).head
+      }
+    }
+  }
+
+  def findTopKNeighbors(prediction: INDArray, df: DataFrame, k: Int): Array[Row] = {
+    val predictionArray = new Array[Double](prediction.length().toInt)
+    for (i <- 0 until prediction.length().toInt) {
+      predictionArray(i) = prediction.getDouble(i.toLong)
+    }
+    val predVector = Vectors.dense(predictionArray)
+
+    val rows = df.collect()
+    rows.map { row =>
+        val embedding = row.getAs[Vector]("embedding")
+        (row, Vectors.sqdist(predVector, embedding))
+      }
+      .sortBy(_._2)
+      .take(k)
+      .map(_._1)
+  }
+
+  def generateText(model: MultiLayerNetwork,
+                   df: DataFrame,
+                   inputSentence: String,
+                   vocabulary: Seq[String],
+                   numWords: Int,
+                   temperature: Double = 0.8): String = {
+
+    val embeddingDim = df.first().getAs[Vector]("embedding").size
     val positionalEmbeddings = computePositionalEmbedding(windowSize, embeddingDim)
     val generated = ArrayBuffer[String]()
-    var currentWindow = seedTokens.toBuffer
+
+    var currentWindow = preprocessInput(inputSentence, df).takeRight(windowSize).toBuffer
+    val usedWords = MutableSet[String]()
+    inputSentence.toLowerCase.split("\\s+").foreach(usedWords.add)
+
+    val random = new Random()
 
     for (_ <- 1 to numWords) {
-      // Prepare input
       val inputEmbeddings = currentWindow.map(_.getAs[Vector]("embedding"))
       val positionAwareEmbeddings = inputEmbeddings.zip(positionalEmbeddings).map {
         case (wordEmb, posEmb) =>
@@ -115,64 +166,92 @@ object SlidingWindow {
           Vectors.dense(combined)
       }
 
-      // Convert to Nd4j array and reshape
       val inputArray = Nd4j.create(positionAwareEmbeddings.flatMap(_.toArray).toArray)
       val reshapedInput = inputArray.reshape(1, windowSize, embeddingDim)
 
-      // Apply self-attention
       val attentionOutput = selfAttention(reshapedInput)
       val flattenedInput = attentionOutput.reshape(1, windowSize * embeddingDim)
-
-      // Get prediction
       val prediction = model.output(flattenedInput)
 
-      // Find nearest neighbor in embedding space
-      val nextToken = findNearestNeighbor(prediction, df)
-      generated += nextToken.getAs[String]("word")
+      val K = 10
+      val candidates = findTopKNeighbors(prediction, df, K)
+        .map(_.getAs[String]("word"))
+        .filter(word => !usedWords.contains(word))
 
-      // Update window
-      currentWindow = currentWindow.tail :+ nextToken
+      if (candidates.nonEmpty) {
+        val selectedWord = candidates(random.nextInt(candidates.length))
+        generated += selectedWord
+        usedWords.add(selectedWord)
+        currentWindow = currentWindow.tail :+ df.filter(df("word") === selectedWord).head
+      } else {
+        val randomWord = vocabulary(random.nextInt(vocabulary.size))
+        generated += randomWord
+        currentWindow = currentWindow.tail :+ df.filter(df("word") === randomWord).head
+      }
     }
 
-    generated
+    generated.mkString(" ")
   }
 
-  def findNearestNeighbor(prediction: INDArray, df: DataFrame): Row = {
-    // Convert INDArray to Vector
-    val predictionArray = new Array[Double](prediction.length().toInt)
-    for (i <- 0 until prediction.length().toInt) {
-      // Fix: Use getDouble with a long parameter
-      predictionArray(i) = prediction.getDouble(i.toLong)  // Convert i to Long
-      // Alternative fix: Use varargs syntax
-      // predictionArray(i) = prediction.getDouble(i: Int*)
-    }
-    val predVector = Vectors.dense(predictionArray)
+  def trainModel(df: DataFrame): (MultiLayerNetwork, Int) = {
+    val embeddingDim = df.first().getAs[Vector]("embedding").size
+    val positionalEmbeddings = computePositionalEmbedding(windowSize, embeddingDim)
 
-    // Find closest embedding
     val rows = df.collect()
-    rows.minBy { row =>
-      val embedding = row.getAs[Vector]("embedding")
-      Vectors.sqdist(predVector, embedding)
+    val slidingWindows = rows.sliding(windowSize + 1).flatMap { window =>
+      if (window.length == windowSize + 1) {
+        val inputEmbeddings = window.take(windowSize).map(_.getAs[Vector]("embedding"))
+        val positionAwareEmbeddings = inputEmbeddings.zip(positionalEmbeddings).map {
+          case (wordEmb, posEmb) =>
+            val combined = (wordEmb.toArray, posEmb.toArray).zipped.map(_ + _)
+            Vectors.dense(combined)
+        }
+
+        val targetEmbedding = window.last.getAs[Vector]("embedding")
+        val input = Nd4j.create(positionAwareEmbeddings.flatMap(_.toArray).toArray)
+        val target = Nd4j.create(targetEmbedding.toArray)
+
+        Some(new DataSet(input, target))
+      } else None
+    }.toList
+
+    val inputSize = windowSize * embeddingDim
+    val outputSize = embeddingDim
+    val model = createModel(inputSize, hiddenSize, outputSize)
+
+    println("Starting model training...")
+    for (epoch <- 0 until numEpochs) {
+      slidingWindows.grouped(batchSize).foreach { batch =>
+        val features = Nd4j.vstack(batch.map(_.getFeatures): _*)
+        val labels = Nd4j.vstack(batch.map(_.getLabels): _*)
+        model.fit(features, labels)
+      }
+      println(s"Completed epoch $epoch")
     }
+
+    (model, embeddingDim)
   }
 
   def main(args: Array[String]): Unit = {
     val spark = SparkSession.builder()
-      .appName("SlidingWindow")
+      .appName("TextGenerator")
       .master("local[*]")
       .getOrCreate()
 
     try {
       spark.sparkContext.setLogLevel("ERROR")
 
-      // Read embeddings data
-      val inputPath = "/Users/niharikabelavadishekar/Documents/Cloud_Assignment/Homework2_LLM/src/main/resources/input/part-r-00000"
-      val data = spark.sparkContext.textFile(inputPath)
+      println("Loading vocabulary...")
+      val vocabulary = loadVocabulary(vocabularyPath)
 
-      // Parse input data with error handling
+      println("Loading embeddings...")
+      val data = spark.sparkContext.textFile(embeddingsPath)
+        .map(_.trim)
+        .filter(_.nonEmpty)
+
       val parsedRows = data.map { line =>
         try {
-          val parts = line.trim.split("\\s+", 3)
+          val parts = line.split("\\s+", 3)
           if (parts.length == 3) {
             val word = parts(0)
             val tokenId = parts(1).toInt
@@ -197,57 +276,19 @@ object SlidingWindow {
 
       val df = spark.createDataFrame(parsedRows, schema).cache()
 
-      // Create and process sliding windows
-      val embeddingDim = df.first().getAs[Vector]("embedding").size
-      val positionalEmbeddings = computePositionalEmbedding(windowSize, embeddingDim)
+      println("Training model...")
+      val (model, embeddingDim) = trainModel(df)
 
-      // Create training datasets
-      val rows = df.collect()
-      val slidingWindows = rows.sliding(windowSize + 1).flatMap { window =>
-        if (window.length == windowSize + 1) {
-          val inputEmbeddings = window.take(windowSize).map(_.getAs[Vector]("embedding"))
-          val positionAwareEmbeddings = inputEmbeddings.zip(positionalEmbeddings).map {
-            case (wordEmb, posEmb) =>
-              val combined = (wordEmb.toArray, posEmb.toArray).zipped.map(_ + _)
-              Vectors.dense(combined)
-          }
+      println("\nGenerating text...")
+      val generatedText = generateText(model, df, inputText, vocabulary, 10)
 
-          val targetEmbedding = window.last.getAs[Vector]("embedding")
-
-          // Create input array
-          val input = Nd4j.create(positionAwareEmbeddings.flatMap(_.toArray).toArray)
-          val target = Nd4j.create(targetEmbedding.toArray)
-
-          Some(new DataSet(input, target))
-        } else None
-      }.toList
-
-      // Train model
-      val inputSize = windowSize * embeddingDim
-      val hiddenSize = 128
-      val outputSize = embeddingDim
-      val model = createModel(inputSize, hiddenSize, outputSize)
-
-      println("Starting model training...")
-      val numEpochs = 10
-      for (epoch <- 0 until numEpochs) {
-        slidingWindows.grouped(batchSize).foreach { batch =>
-          val features = Nd4j.vstack(batch.map(_.getFeatures): _*)
-          val labels = Nd4j.vstack(batch.map(_.getLabels): _*)
-          model.fit(features, labels)
-        }
-        println(s"Completed epoch $epoch")
-      }
-
-      // Generate sample text
-      val seedTokens = rows.take(windowSize)
-      val generatedText = generateText(model, df, seedTokens, 20)
-      println("Generated text: " + generatedText.mkString(" "))
+      println(s"\nInput: $inputText")
+      println(s"Generated continuation: $generatedText")
 
       // Save model
-      val modelPath = "src/main/resources/output/trained_model.zip"
+      val modelPath = "trained_model.zip"
       ModelSerializer.writeModel(model, new File(modelPath), true)
-      println(s"Model saved to $modelPath")
+      println(s"\nModel saved to $modelPath")
 
     } catch {
       case e: Exception =>
