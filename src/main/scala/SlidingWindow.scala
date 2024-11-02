@@ -262,7 +262,7 @@ object SlidingWindow {
     tokenizer.fit(texts) // Ensure 'fit' works with collected texts
 
     // Generate text using the trained model
-    val generatedText = model.generateText(trainedModel, tokenizer, "Once upon a time", 50)
+    val generatedText = model.generateText(trainedModel, tokenizer, "Once upon a time, there lived a prince", 50)
     val cleanedText = generatedText.replaceAll("\\s+", " ")
     println(s"Generated text: $cleanedText")
 
