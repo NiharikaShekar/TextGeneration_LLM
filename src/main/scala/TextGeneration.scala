@@ -1,3 +1,4 @@
+// Importing necessary libraries
 import org.apache.commons.io.output.ByteArrayOutputStream
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.rdd.RDD
@@ -21,10 +22,14 @@ import java.io.{BufferedWriter, ByteArrayInputStream, ObjectInputStream, ObjectO
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
 import scala.collection.JavaConverters._
+import org.slf4j.LoggerFactory
 
-
+// This is the main class for text generation and this requires a configuration manager
 class TextGeneration(config: ConfigurationManager) extends Serializable {
+  private val logger = LoggerFactory.getLogger(getClass)
+  // Serializing model parameters and configurations into a byte array
   private def serializeModel(model: MultiLayerNetwork): Array[Byte] = {
+    logger.debug("Starting model serialization")
     val baos = new ByteArrayOutputStream()
     try {
       val oos = new ObjectOutputStream(baos)
@@ -34,10 +39,13 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
       baos.toByteArray
     } finally {
       baos.close()
+      logger.info("Model serialization completed successfully")
     }
   }
 
+  // Deserializing byte array back to a MultiLayerNetwork model
   private def deserializeModel(bytes: Array[Byte]): MultiLayerNetwork = {
+    logger.debug("Starting model deserialization")
     val bais = new ByteArrayInputStream(bytes)
     try {
       val ois = new ObjectInputStream(bais)
@@ -49,27 +57,28 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
       model
     } finally {
       bais.close()
+      logger.info("Model deserialization completed successfully")
     }
+
   }
 
-  // Create sliding windows for training data
+  // This is used to create sliding windows over token sequence for training text generation
   def createSlidingWindows(tokens: Seq[Int]): Seq[(Seq[Int], Int)] = {
     tokens.sliding(config.windowSize + 1).map { window =>
       (window.init, window.last)
     }.toSeq
   }
 
-  // Convert sequence to embedding matrix with positional encoding
+  // Generating an embedding matrix with positional encoding for a sequence of tokens
   def createEmbeddingMatrix(sequence: Seq[Int]): INDArray = {
     val embedding = Nd4j.zeros(1, config.embeddingSize, sequence.length)
 
-    // Create word embeddings
     sequence.zipWithIndex.foreach { case (token, pos) =>
       val tokenEmbedding = Nd4j.randn(1, config.embeddingSize).mul(0.1)
       embedding.putSlice(pos, tokenEmbedding)
     }
 
-    // Add positional encodings
+    // Adding positional encodings to the embedding matrix
     for (pos <- sequence.indices) {
       for (i <- 0 until config.embeddingSize) {
         val angle = pos / math.pow(10000, (2 * i).toFloat / config.embeddingSize)
@@ -84,7 +93,7 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
     embedding
   }
 
-  // Self-attention mechanism
+  // Now we are implementing the self-attention mechanism using query, key and value matrices
   def selfAttention(input: INDArray): INDArray = {
     val Array(batchSize, sequenceLength, embedSize) = input.shape()
 
@@ -109,7 +118,7 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
     attendedOutput.reshape(batchSize, sequenceLength, embedSize)
   }
 
-  // Build neural network model
+  // Building a neural network model configuration
   def buildModel(validationIterator: DataSetIterator): MultiLayerNetwork = {
     val conf = new NeuralNetConfiguration.Builder()
       .seed(config.seed)
@@ -138,13 +147,14 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
 
     val model = new MultiLayerNetwork(conf)
     model.init()
-    // Add listeners for monitoring
+
+    // Setting listeners for logging and evaluation
     val listener = new CustomTrainingListener
     model.setListeners(listener, new GradientNormListener(10), new EvaluativeListener(validationIterator, 1))
     model
   }
 
-  // Create validation dataset iterator
+  // Creating validation dataset iterator
   def createValidationDataSetIterator(validationDataRDD: RDD[String], tokenizer: SimpleTokenizer): DataSetIterator = {
     val validationData = validationDataRDD.flatMap { text =>
       val tokens = tokenizer.encode(text)
@@ -167,7 +177,7 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
     new ListDataSetIterator(validationData, config.batchSize)
   }
 
-  // Process batch of data
+  // Processing a batch of data and then fitting it into the model
   private def processBatch(model: MultiLayerNetwork, batch: Seq[(Seq[Int], Int)]): (Double, Long, Long) = {
     val inputArray = Nd4j.zeros(batch.size, config.embeddingSize * config.windowSize)
     val labelsArray = Nd4j.zeros(batch.size, config.vocabularySize)
@@ -192,7 +202,7 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
     (model.score(), correct, batch.size)
   }
 
-  // Average multiple models
+  // Here we are averaging multiple models by their parameters
   private def averageModels(models: Array[MultiLayerNetwork]): MultiLayerNetwork = {
     val firstModel = models(0)
     if (models.length == 1) return firstModel
@@ -206,45 +216,54 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
     result
   }
 
-  // Train model
+  // Training the model for text generation
   def train(sc: SparkContext, textRDD: RDD[String], metricsWriter: BufferedWriter): MultiLayerNetwork = {
+    logger.info(s"Starting training for $config.epochs epochs")
     val tokenizer = new SimpleTokenizer()
     val allTexts = textRDD.collect()
     tokenizer.fit(allTexts)
     val broadcastTokenizer = sc.broadcast(tokenizer)
 
+    // Splitting the dataset into training (80%) and validation (20%) data
     val Array(trainingDataRDD, validationDataRDD) = textRDD.randomSplit(Array(0.8, 0.2))
     val validationDataSetIterator = createValidationDataSetIterator(validationDataRDD, tokenizer)
 
+    // Building the initial model and serializing it for broadcasting
     val model = buildModel(validationDataSetIterator)
     var currentModelBytes = serializeModel(model)
     var broadcastModel = sc.broadcast(currentModelBytes)
 
+    // These are the accumulators to track training metrics across partitions
     val batchProcessedAcc = sc.longAccumulator("batchesProcessed")
     val totalLossAcc = sc.doubleAccumulator("totalLoss")
     val correctPredictionsAcc = sc.longAccumulator("correctPredictions")
     val totalPredictionsAcc = sc.longAccumulator("totalPredictions")
 
+    // Looping through epochs for training
     for (epoch <- 1 to config.epochs) {
       val epochStartTime = System.currentTimeMillis()
       println(s"Starting epoch $epoch")
 
+      // Getting learning rate for the current epoch
       val learningRate = model.getLayerWiseConfigurations.getConf(0).getLayer
         .asInstanceOf[org.deeplearning4j.nn.conf.layers.BaseLayer]
         .getIUpdater.asInstanceOf[Adam].getLearningRate(epoch, config.epochs)
 
       println(s"Effective learning rate for epoch $epoch: $learningRate")
 
+      // We are resetting the accumulators at the beginning of each epoch
       batchProcessedAcc.reset()
       totalLossAcc.reset()
       correctPredictionsAcc.reset()
       totalPredictionsAcc.reset()
 
+      // Generating sliding windows over the token sequences in training data
       val samplesRDD = trainingDataRDD.flatMap { text =>
         val tokens = broadcastTokenizer.value.encode(text)
         createSlidingWindows(tokens)
       }.persist()
 
+      // Processing the training data in distributed batches
       val processedRDD = samplesRDD.mapPartitions { partition =>
         val localModel = deserializeModel(broadcastModel.value)
         val batchBuffer = new scala.collection.mutable.ArrayBuffer[(Seq[Int], Int)]()
@@ -252,6 +271,7 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
         var localCorrect = 0L
         var localTotal = 0L
 
+        // Processing samples in batches within each partition
         partition.foreach { sample =>
           batchBuffer += sample
           if (batchBuffer.size >= config.batchSize) {
@@ -272,6 +292,7 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
           batchProcessedAcc.add(1)
         }
 
+        // Accumulating the metrics across all partitions
         totalLossAcc.add(localLoss)
         correctPredictionsAcc.add(localCorrect)
         totalPredictionsAcc.add(localTotal)
@@ -279,6 +300,7 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
         Iterator.single(serializeModel(localModel))
       }
 
+      // Collecting the updated models from all partitions
       val updatedModels = processedRDD.collect()
       if (updatedModels.nonEmpty) {
         val averagedModel = if (updatedModels.length > 1) {
@@ -292,13 +314,14 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
         currentModelBytes = serializeModel(averagedModel)
         broadcastModel = sc.broadcast(currentModelBytes)
 
+        // Calculate metrics for the current epoch
         val epochDuration = System.currentTimeMillis() - epochStartTime
         val avgLoss = totalLossAcc.value / batchProcessedAcc.value
         val accuracy = if (totalPredictionsAcc.value > 0) {
           correctPredictionsAcc.value.toDouble / totalPredictionsAcc.value
         } else 0.0
 
-        // Log metrics
+        // Logging the metrics
         println(f"""
                    |Epoch $epoch Statistics:
                    |Duration: ${epochDuration}ms
@@ -313,37 +336,42 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
           s"$executor: Max Memory = $maxMemory, Remaining Memory = $remainingMemory"
         }
 
-        // Write metrics to CSV
+        // Now, we write this metrics to a CSV file
         metricsWriter.write(f"$epoch,$learningRate%.6f,$avgLoss%.4f,${accuracy * 100}%.2f,${batchProcessedAcc.value},${totalPredictionsAcc.value},$epochDuration,${textRDD.getNumPartitions},${textRDD.count()},,${executorMemoryStatus.mkString("\n")}\n")
       }
-
+      logger.info(s"Epoch $epoch completed")
       samplesRDD.unpersist()
     }
 
     deserializeModel(broadcastModel.value)
   }
 
-  // Generate text
+  // Generating text using the trained model
   def generateText(model: MultiLayerNetwork, tokenizer: SimpleTokenizer, seedText: String, length: Int, temperature: Double = 0.7): String = {
+    logger.info(s"Starting text generation with seed text: $seedText")
     var currentSequence = tokenizer.encode(seedText).takeRight(config.windowSize)
     val generated = new ArrayBuffer[Int]()
     val rand = new Random()
 
+    // This is a function which samples a token index from output logits with temperature
     def sampleWithTemperature(logits: INDArray, temp: Double): Int = {
       val scaled = logits.div(temp)
       val expScaled = Transforms.exp(scaled)
       val probs = expScaled.div(expScaled.sum(1))
 
+      // Creating a probability array
       val probArray = Array.ofDim[Double](probs.columns())
       for (i <- 0 until probs.columns()) {
         probArray(i) = probs.getDouble(Long.box(i))
       }
 
+      // Calculating cumulative probabilities for sampling
       val cumSum = probArray.scanLeft(0.0)(_ + _).tail
       val sample = rand.nextDouble()
       cumSum.zipWithIndex.find(_._1 >= sample).map(_._2).getOrElse(0)
     }
 
+    // Generating the specified number of tokens
     for (_ <- 1 to length) {
       val embedding = createEmbeddingMatrix(currentSequence)
       val attentionOutput = selfAttention(embedding)
@@ -352,14 +380,17 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
       val output = model.output(flattenedAttention)
       val nextTokenIndex = sampleWithTemperature(output, temperature)
 
+      // Adding the sampled token index to the generated sequence
       generated += nextTokenIndex
       currentSequence = (currentSequence.tail :+ nextTokenIndex).takeRight(config.windowSize)
     }
-
+    logger.info(s"Text generation completed")
+    // Decoding the generated token indices back to text
     tokenizer.decode(generated.toSeq)
+
   }
 
-  // Get Spark configuration
+  // Getting the Spark configuration
   def getSparkConf(): SparkConf = {
     new SparkConf()
       .setAppName(config.sparkAppName)
@@ -378,6 +409,7 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
   }
 }
 
+// This is the main entry point of the application
 object Text_Generation {
   def main(args: Array[String]): Unit = {
     val environment = if (args.isEmpty) "local" else args(0)
@@ -385,6 +417,7 @@ object Text_Generation {
     val fileHandler = new FileHandler(config)
     val model = new TextGeneration(config)
 
+    // Creating a Spark context with the specified configuration
     val sc = new SparkContext(model.getSparkConf())
     sc.setLogLevel("INFO")
     val metricsWriter = fileHandler.createMetricsWriter()
@@ -394,15 +427,18 @@ object Text_Generation {
       println(s"Number of partitions: ${textRDD.getNumPartitions}")
       println(s"Total number of lines: ${textRDD.count()}")
 
+      // Training the model using the training data
       val trainedModel = model.train(sc, textRDD, metricsWriter)
       val tokenizer = new SimpleTokenizer()
       tokenizer.fit(textRDD.collect())
 
+      // Reading a sample seed word from the file handler for generating text
       val seedWord = fileHandler.readSampleWord()
       val generatedText = model.generateText(trainedModel, tokenizer, seedWord, 50)
       val cleanedText = generatedText.replaceAll("\\s+", " ")
       fileHandler.writeGeneratedText(cleanedText)
 
+      //Printing the generated text to the console
       println(s"Generated text: $cleanedText")
       println(s"Text has been saved to: ${config.outputPath}")
     } finally {
