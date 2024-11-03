@@ -27,7 +27,7 @@ import scala.collection.JavaConverters._
 import scala.util.Random
 
 // Configuration class to handle application.conf
-class ConfigurationManager(environment: String) {
+class ConfigurationManager(environment: String) extends Serializable {
   private val config: Config = ConfigFactory.load().getConfig(environment)
 
   // Spark configuration
@@ -36,8 +36,8 @@ class ConfigurationManager(environment: String) {
   val executorMemory: String = config.getString("spark.executor.memory")
   val driverMemory: String = config.getString("spark.driver.memory")
   val serializer: String = config.getString("spark.serializer")
-  val kryoBufferMax: String = config.getString("spark.kryoserializer.buffer.max")
-  val kryoBuffer: String = config.getString("spark.kryoserializer.buffer")
+//  val kryoBufferMax: String = config.getString("spark.kryoserializer.buffer.max")
+//  val kryoBuffer: String = config.getString("spark.kryoserializer.buffer")
 
   // Model configuration
   val vocabularySize: Int = config.getInt("model.vocabulary.size")
@@ -57,7 +57,7 @@ class ConfigurationManager(environment: String) {
 }
 
 // Class to handle file operations
-class FileHandler(config: ConfigurationManager) {
+class FileHandler(config: ConfigurationManager) extends Serializable{
   def readSampleWord(): String = {
     try {
       val source = scala.io.Source.fromFile(config.samplePath)
@@ -486,8 +486,8 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
       .set("spark.executor.memory", config.executorMemory)
       .set("spark.driver.memory", config.driverMemory)
       .set("spark.serializer", config.serializer)
-      .set("spark.kryoserializer.buffer.max", config.kryoBufferMax)
-      .set("spark.kryoserializer.buffer", config.kryoBuffer)
+      .set("spark.kryoserializer.buffer.max", "512m")
+      .set("spark.kryoserializer.buffer", "256m")
       .registerKryoClasses(Array(
         classOf[MultiLayerNetwork],
         classOf[INDArray],
@@ -498,7 +498,7 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
 }
 
 // Main object
-object TextGenerationLLM {
+object Text_Generation {
   def main(args: Array[String]): Unit = {
     // Initialize configuration
     val environment = if (args.isEmpty) "local" else args(0)
