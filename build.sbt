@@ -27,6 +27,8 @@ lazy val root = project
       "org.deeplearning4j" % "deeplearning4j-nlp" % "1.0.0-M2.1",
       "org.nd4j" % "nd4j-native-platform" % "1.0.0-M2.1",
       "commons-io" % "commons-io" % "2.11.0",
+      "com.typesafe" % "config" % "1.4.2",
+
 
       // Logging
       "org.slf4j" % "slf4j-api" % "2.0.13",
