@@ -1,148 +1,29 @@
-import com.typesafe.config.{Config, ConfigFactory}
 import org.apache.commons.io.output.ByteArrayOutputStream
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.rdd.RDD
+import org.deeplearning4j.datasets.iterator.utilty.ListDataSetIterator
 import org.deeplearning4j.nn.conf.NeuralNetConfiguration
 import org.deeplearning4j.nn.conf.layers.{DenseLayer, OutputLayer}
 import org.deeplearning4j.nn.multilayer.MultiLayerNetwork
 import org.deeplearning4j.nn.weights.WeightInit
-import org.deeplearning4j.optimize.listeners.{EvaluativeListener, ScoreIterationListener}
+import org.deeplearning4j.optimize.listeners.EvaluativeListener
 import org.nd4j.linalg.activations.Activation
 import org.nd4j.linalg.api.ndarray.INDArray
+import org.nd4j.linalg.dataset.DataSet
+import org.nd4j.linalg.dataset.api.iterator.DataSetIterator
 import org.nd4j.linalg.factory.Nd4j
 import org.nd4j.linalg.learning.config.Adam
 import org.nd4j.linalg.lossfunctions.LossFunctions
-import org.nd4j.linalg.ops.transforms.Transforms
-import org.deeplearning4j.datasets.iterator.utilty.ListDataSetIterator
-import org.deeplearning4j.nn.api.Model
-import org.deeplearning4j.optimize.api.IterationListener
-import org.nd4j.linalg.dataset.DataSet
-import org.nd4j.linalg.dataset.api.iterator.DataSetIterator
 import org.nd4j.linalg.schedule.{ExponentialSchedule, ScheduleType}
+import org.nd4j.linalg.ops.transforms.Transforms
 
-import java.io._
-import java.nio.file.{Files, Paths}
+import java.io.{BufferedWriter, ByteArrayInputStream, ObjectInputStream, ObjectOutputStream}
 import scala.collection.mutable.ArrayBuffer
-import scala.collection.JavaConverters._
 import scala.util.Random
+import scala.collection.JavaConverters._
 
-// Configuration class to handle application.conf
-class ConfigurationManager(environment: String) extends Serializable {
-  private val config: Config = ConfigFactory.load().getConfig(environment)
 
-  // Spark configuration
-  val sparkAppName: String = config.getString("spark.app.name")
-  val sparkMaster: String = config.getString("spark.master")
-  val executorMemory: String = config.getString("spark.executor.memory")
-  val driverMemory: String = config.getString("spark.driver.memory")
-  val serializer: String = config.getString("spark.serializer")
-//  val kryoBufferMax: String = config.getString("spark.kryoserializer.buffer.max")
-//  val kryoBuffer: String = config.getString("spark.kryoserializer.buffer")
-
-  // Model configuration
-  val vocabularySize: Int = config.getInt("model.vocabulary.size")
-  val embeddingSize: Int = config.getInt("model.embedding.size")
-  val windowSize: Int = config.getInt("model.window.size")
-  val batchSize: Int = config.getInt("model.batch.size")
-  val epochs: Int = config.getInt("model.epochs")
-  val seed: Int = config.getInt("model.seed")
-  val learningRate: Double = config.getDouble("model.learning.rate")
-  val decayRate: Double = config.getDouble("model.decay.rate")
-
-  // File paths
-  val inputPath: String = config.getString("paths.input")
-  val samplePath: String = config.getString("paths.sample")
-  val outputPath: String = config.getString("paths.output")
-  val metricsPath: String = config.getString("paths.metrics")
-}
-
-// Class to handle file operations
-class FileHandler(config: ConfigurationManager) extends Serializable{
-  def readSampleWord(): String = {
-    try {
-      val source = scala.io.Source.fromFile(config.samplePath)
-      val word = source.mkString.trim
-      source.close()
-      word
-    } catch {
-      case e: Exception =>
-        println(s"Error reading sample word: ${e.getMessage}")
-        "scientist" // Default fallback word
-    }
-  }
-
-  def writeGeneratedText(text: String): Unit = {
-    try {
-      val writer = new PrintWriter(config.outputPath)
-      writer.write(text)
-      writer.close()
-    } catch {
-      case e: Exception =>
-        println(s"Error writing generated text: ${e.getMessage}")
-    }
-  }
-
-  def createMetricsWriter(): BufferedWriter = {
-    val file = new File(config.metricsPath)
-    file.getParentFile.mkdirs() // Create directories if they don't exist
-    val writer = new BufferedWriter(new FileWriter(file))
-    writer.write("Epoch,\tLearningRate,\tLoss,\tAccuracy,\tBatchesProcessed,\tPredictionsMade,\tEpochDuration,\tNumber of partitions,\tNumber Of Lines,\tMemoryUsed\n")
-    writer
-  }
-}
-
-// Tokenizer class for text processing
-class SimpleTokenizer extends Serializable {
-  private var wordToIndex = Map[String, Int]()
-  private var indexToWord = Map[Int, String]()
-  private var currentIdx = 0
-
-  def fit(texts: Seq[String]): Unit = {
-    texts.flatMap(_.split("\\s+")).distinct.foreach { word =>
-      if (!wordToIndex.contains(word)) {
-        wordToIndex += (word -> currentIdx)
-        indexToWord += (currentIdx -> word)
-        currentIdx += 1
-      }
-    }
-  }
-
-  def encode(text: String): Seq[Int] = {
-    text.split("\\s+").map(word => wordToIndex.getOrElse(word, 0))
-  }
-
-  def decode(indices: Seq[Int]): String = {
-    indices.map(idx => indexToWord.getOrElse(idx, "")).mkString(" ")
-  }
-}
-
-// Custom training listener for monitoring
-class CustomTrainingListener extends ScoreIterationListener(10) {
-  private var currentScore: Double = 0.0
-
-  override def iterationDone(model: Model, iteration: Int, epochNum: Int): Unit = {
-    super.iterationDone(model, iteration, epochNum)
-    currentScore = model.score()
-  }
-
-  def getLastScore: Double = currentScore
-}
-
-// Gradient monitoring listener
-class GradientNormListener(logFrequency: Int) extends IterationListener {
-  override def iterationDone(model: Model, iteration: Int, epoch: Int): Unit = {
-    if (iteration % logFrequency == 0) {
-      val gradients: INDArray = model.gradient().gradient()
-      val gradientMean = gradients.meanNumber().doubleValue()
-      val gradientMax = gradients.maxNumber().doubleValue()
-      val gradientMin = gradients.minNumber().doubleValue()
-      println(s"Iteration $iteration: Gradient Mean = $gradientMean, Max = $gradientMax, Min = $gradientMin")
-    }
-  }
-}
-// Main model class
 class TextGeneration(config: ConfigurationManager) extends Serializable {
-  // Model serialization methods
   private def serializeModel(model: MultiLayerNetwork): Array[Byte] = {
     val baos = new ByteArrayOutputStream()
     try {
@@ -497,52 +378,33 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
   }
 }
 
-// Main object
 object Text_Generation {
   def main(args: Array[String]): Unit = {
-    // Initialize configuration
     val environment = if (args.isEmpty) "local" else args(0)
     val config = new ConfigurationManager(environment)
     val fileHandler = new FileHandler(config)
     val model = new TextGeneration(config)
 
-    // Initialize Spark context
     val sc = new SparkContext(model.getSparkConf())
     sc.setLogLevel("INFO")
-
-    // Create metrics writer before try block
     val metricsWriter = fileHandler.createMetricsWriter()
 
     try {
-      // Read input text
-      val textRDD = sc.textFile(config.inputPath)
-        .map(_.trim)
-        .filter(_.nonEmpty)
-        .cache()
-
-      // Print initial statistics
+      val textRDD = sc.textFile(config.inputPath).map(_.trim).filter(_.nonEmpty).cache()
       println(s"Number of partitions: ${textRDD.getNumPartitions}")
       println(s"Total number of lines: ${textRDD.count()}")
 
-      // Train model
       val trainedModel = model.train(sc, textRDD, metricsWriter)
-
-      // Initialize tokenizer
       val tokenizer = new SimpleTokenizer()
-      val texts = textRDD.collect()
-      tokenizer.fit(texts)
+      tokenizer.fit(textRDD.collect())
 
-      // Read sample word and generate text
       val seedWord = fileHandler.readSampleWord()
       val generatedText = model.generateText(trainedModel, tokenizer, seedWord, 50)
       val cleanedText = generatedText.replaceAll("\\s+", " ")
-
-      // Write generated text to file
       fileHandler.writeGeneratedText(cleanedText)
 
       println(s"Generated text: $cleanedText")
       println(s"Text has been saved to: ${config.outputPath}")
-
     } finally {
       metricsWriter.close()
       sc.stop()
