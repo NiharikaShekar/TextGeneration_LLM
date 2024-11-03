@@ -1,4 +1,4 @@
-val scala2Version = "2.13.8"  // Updated to match your Scala version
+val scala2Version = "2.13.10"  // Updated to match your Scala version
 val sparkVersion = "3.5.3"
 
 lazy val root = project
@@ -10,11 +10,10 @@ lazy val root = project
 
     libraryDependencies ++= Seq(
       // Spark dependencies
-      "org.apache.spark" %% "spark-core" % sparkVersion % "provided",  // Added provided
-      "org.apache.spark" %% "spark-sql" % sparkVersion % "provided",
-      "org.apache.spark" %% "spark-mllib" % sparkVersion % "provided",
-      "org.apache.spark" %% "spark-streaming" % sparkVersion % "provided",
-
+      "org.apache.spark" %% "spark-core" % sparkVersion,
+      "org.apache.spark" %% "spark-sql" % sparkVersion,
+      "org.apache.spark" %% "spark-mllib" % sparkVersion,
+      "org.apache.spark" %% "spark-streaming" % sparkVersion,
       // Test dependencies
       "org.apache.mrunit" % "mrunit" % "1.1.0" % Test classifier "hadoop2",
       "org.scalameta" %% "munit" % "1.0.0" % Test,
@@ -27,6 +26,7 @@ lazy val root = project
       "org.deeplearning4j" % "deeplearning4j-core" % "1.0.0-M2.1",
       "org.deeplearning4j" % "deeplearning4j-nlp" % "1.0.0-M2.1",
       "org.nd4j" % "nd4j-native-platform" % "1.0.0-M2.1",
+      "commons-io" % "commons-io" % "2.11.0",
 
       // Logging
       "org.slf4j" % "slf4j-api" % "2.0.13",
