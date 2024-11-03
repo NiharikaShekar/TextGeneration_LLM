@@ -1,301 +1,504 @@
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.ml.linalg.{Vector, Vectors}
-import org.apache.spark.sql.{DataFrame, Row}
-import org.apache.spark.sql.types._
-import org.apache.spark.ml.linalg.SQLDataTypes.VectorType
+import org.apache.commons.io.output.ByteArrayOutputStream
+import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.rdd.RDD
 import org.deeplearning4j.nn.conf.NeuralNetConfiguration
 import org.deeplearning4j.nn.conf.layers.{DenseLayer, OutputLayer}
 import org.deeplearning4j.nn.multilayer.MultiLayerNetwork
 import org.deeplearning4j.nn.weights.WeightInit
-import org.deeplearning4j.optimize.listeners.ScoreIterationListener
+import org.deeplearning4j.optimize.listeners.{EvaluativeListener, ScoreIterationListener}
 import org.nd4j.linalg.activations.Activation
-import org.nd4j.linalg.dataset.DataSet
+import org.nd4j.linalg.api.ndarray.INDArray
 import org.nd4j.linalg.factory.Nd4j
-import org.nd4j.linalg.ops.transforms.Transforms
 import org.nd4j.linalg.learning.config.Adam
 import org.nd4j.linalg.lossfunctions.LossFunctions
-import org.nd4j.linalg.api.ndarray.INDArray
-import org.deeplearning4j.util.ModelSerializer
-import scala.collection.mutable.{ArrayBuffer, Set => MutableSet}
-import scala.util.Random
-import scala.util.Try
-import java.io.File
+import org.nd4j.linalg.ops.transforms.Transforms
+import org.nd4j.evaluation.classification.Evaluation
+import org.apache.spark.storage.StorageLevel
+import org.apache.spark.util.LongAccumulator
+import org.deeplearning4j.datasets.iterator.utilty.ListDataSetIterator
+import org.deeplearning4j.nn.api.Model
+import org.deeplearning4j.optimize.api.IterationListener
+import org.nd4j.linalg.dataset.DataSet
+import org.nd4j.linalg.dataset.api.iterator.DataSetIterator
 
-object SlidingWindow {
-  // Constants
-  val embeddingSize = 512
-  val windowSize = 3
-  val batchSize = 32
-  val hiddenSize = 128
-  val numEpochs = 10
+import java.io.{ByteArrayInputStream, ObjectInputStream, ObjectOutputStream}
+import scala.collection.mutable.ArrayBuffer
+import java.time.{Duration, Instant}
+import scala.collection.JavaConverters._
+import scala.util.{Random, Try}
 
-  // Hardcoded paths and input text
-  val embeddingsPath = "/Users/niharikabelavadishekar/Documents/Cloud_Assignment/Homework2_LLM/src/main/resources/input/part-r-00000"
-  val vocabularyPath = "/Users/niharikabelavadishekar/Documents/Cloud_Assignment/Homework2_LLM/src/main/resources/input/vocabulary.txt"
-  val inputText = "the city lights"
 
-  def loadVocabulary(path: String): Seq[String] = {
-    Try {
-      scala.io.Source.fromFile(path).getLines()
-        .map(_.trim)
-        .filter(_.nonEmpty)
-        .toSeq
-    }.getOrElse {
-      println(s"Error loading vocabulary from $path. Using default vocabulary.")
-      Seq("the", "city", "lights")
+class SentenceGenerationImpl extends Serializable {
+  val vocabularySize: Int = 3000
+  val embeddingSize: Int = 32
+  val windowSize: Int = 1
+  val batchSize: Int = 16
+
+
+  class SimpleTokenizer extends Serializable {
+    private var wordToIndex = Map[String, Int]()
+    private var indexToWord = Map[Int, String]()
+    private var currentIdx = 0
+
+    def fit(texts: Seq[String]): Unit = {
+      texts.flatMap(_.split("\\s+")).distinct.foreach { word =>
+        if (!wordToIndex.contains(word)) {
+          wordToIndex += (word -> currentIdx)
+          indexToWord += (currentIdx -> word)
+          currentIdx += 1
+        }
+      }
+    }
+
+    def encode(text: String): Seq[Int] = {
+      text.split("\\s+").map(word => wordToIndex.getOrElse(word, 0))
+    }
+
+    def decode(indices: Seq[Int]): String = {
+      indices.map(idx => indexToWord.getOrElse(idx, "")).mkString(" ")
     }
   }
 
-  def computePositionalEmbedding(windowSize: Int, embeddingDim: Int): Array[Vector] = {
-    val positionalEncodings = new Array[Vector](windowSize)
-    for (pos <- 0 until windowSize) {
-      val embedding = new Array[Double](embeddingDim)
-      for (i <- 0 until embeddingDim by 2) {
-        val angle = pos / math.pow(10000, (2.0 * i) / embeddingDim)
-        embedding(i) = math.sin(angle)
-        if (i + 1 < embeddingDim) {
-          embedding(i + 1) = math.cos(angle)
+  private def serializeModel(model: MultiLayerNetwork): Array[Byte] = {
+    val baos = new ByteArrayOutputStream()
+    try {
+      val oos = new ObjectOutputStream(baos)
+      oos.writeObject(model.params())
+      oos.writeObject(model.getLayerWiseConfigurations)
+      oos.close()
+      baos.toByteArray
+    } finally {
+      baos.close()
+    }
+  }
+
+  private def deserializeModel(bytes: Array[Byte]): MultiLayerNetwork = {
+    val bais = new ByteArrayInputStream(bytes)
+    try {
+      val ois = new ObjectInputStream(bais)
+      val params = ois.readObject().asInstanceOf[INDArray]
+      val conf = ois.readObject().asInstanceOf[org.deeplearning4j.nn.conf.MultiLayerConfiguration]
+      val model = new MultiLayerNetwork(conf)
+      model.init()
+      model.setParams(params)
+      model
+    } finally {
+      bais.close()
+    }
+  }
+
+  // Create sliding windows for training data
+  def createSlidingWindows(tokens: Seq[Int]): Seq[(Seq[Int], Int)] = {
+    tokens.sliding(windowSize + 1).map { window =>
+      (window.init, window.last)
+    }.toSeq
+  }
+
+  // Convert sequence to embedding matrix with positional encoding
+  def createEmbeddingMatrix(sequence: Seq[Int]): INDArray = {
+    val embedding = Nd4j.zeros(1, embeddingSize, sequence.length)
+
+    // Create word embeddings
+    sequence.zipWithIndex.foreach { case (token, pos) =>
+      val tokenEmbedding = Nd4j.randn(1, embeddingSize).mul(0.1)
+      embedding.putSlice(pos, tokenEmbedding)
+    }
+
+    // Add positional encodings
+    for (pos <- sequence.indices) {
+      for (i <- 0 until embeddingSize) {
+        val angle = pos / math.pow(10000, (2 * i).toFloat / embeddingSize)
+        if (i % 2 == 0) {
+          embedding.putScalar(Array(0, i, pos), embedding.getDouble(0, i, pos) + math.sin(angle))
+        } else {
+          embedding.putScalar(Array(0, i, pos), embedding.getDouble(0, i, pos) + math.cos(angle))
         }
       }
-      positionalEncodings(pos) = Vectors.dense(embedding)
     }
-    positionalEncodings
+
+    embedding
   }
 
   def selfAttention(input: INDArray): INDArray = {
-    val shape = input.shape()
-    val batchSize = shape(0).toInt
-    val sequenceLength = shape(1).toInt
-    val embedSize = shape(2).toInt
+    val Array(batchSize, sequenceLength, embedSize) = input.shape()
 
-    val query = input.dup()
-    val key = input.dup()
-    val value = input.dup()
+    // Create query, key, and value matrices for each batch independently
+    val query = Nd4j.createUninitialized(batchSize, sequenceLength, embedSize)
+    val key = Nd4j.createUninitialized(batchSize, sequenceLength, embedSize)
+    val value = Nd4j.createUninitialized(batchSize, sequenceLength, embedSize)
 
-    val keyTransposed = key.permute(0, 2, 1)
-    val scores = Nd4j.matmul(query, keyTransposed)
+    // Ensure query, key, and value are initialized properly
+    if (query.isEmpty || key.isEmpty || value.isEmpty) {
+      return Nd4j.empty()
+    }
+
+    // Compute the dot product between queries and keys
+    val scores = query
+      .tensorAlongDimension(0, 1, 2)
+      .mmul(key.tensorAlongDimension(0, 1, 2).transpose())
       .div(math.sqrt(embedSize))
 
+    // Apply softmax along the last dimension to get attention weights
     val attentionWeights = Transforms.softmax(scores)
-    Nd4j.matmul(attentionWeights, value)
+
+    // Multiply the weights with the values
+    val attendedOutput = attentionWeights
+      .tensorAlongDimension(0, 1, 2)
+      .mmul(value.tensorAlongDimension(0, 1, 2))
+
+    attendedOutput.reshape(batchSize, sequenceLength, embedSize)
   }
 
-  def createModel(inputSize: Int, hiddenSize: Int, outputSize: Int): MultiLayerNetwork = {
+  case class TrainingMetrics(
+                              epoch: Int,
+                              batchTime: Long,
+                              loss: Double,
+                              accuracy: Double,
+                              memoryUsed: Long,
+                              batchesProcessed: Long
+                            )
+
+  // Custom listener for collecting training metrics
+  class CustomTrainingListener extends ScoreIterationListener(10) {
+    private var currentScore: Double = 0.0
+
+    override def iterationDone(model: org.deeplearning4j.nn.api.Model, iteration: Int, epochNum: Int): Unit = {
+      super.iterationDone(model, iteration, epochNum)
+      currentScore = model.score()
+    }
+
+    def getLastScore: Double = currentScore
+  }
+
+  def buildModel(validationIterator : DataSetIterator): MultiLayerNetwork = {
     val conf = new NeuralNetConfiguration.Builder()
-      .seed(123)
-      .updater(new Adam(0.001))
+      .seed(42)
+      .updater(new Adam(0.005))
       .weightInit(WeightInit.XAVIER)
       .list()
       .layer(0, new DenseLayer.Builder()
-        .nIn(inputSize)
-        .nOut(hiddenSize)
+        .nIn(embeddingSize * windowSize)
+        .nOut(128)
         .activation(Activation.RELU)
         .dropOut(0.2)
         .build())
       .layer(1, new DenseLayer.Builder()
-        .nIn(hiddenSize)
-        .nOut(hiddenSize / 2)
+        .nIn(512)
+        .nOut(128)
         .activation(Activation.RELU)
         .dropOut(0.2)
         .build())
-      .layer(2, new OutputLayer.Builder(LossFunctions.LossFunction.MSE)
-        .nIn(hiddenSize / 2)
-        .nOut(outputSize)
-        .activation(Activation.IDENTITY)
+      .layer(2, new OutputLayer.Builder()
+        .nIn(128)
+        .nOut(vocabularySize)
+        .activation(Activation.SOFTMAX)
+        .lossFunction(LossFunctions.LossFunction.NEGATIVELOGLIKELIHOOD)
         .build())
       .build()
 
     val model = new MultiLayerNetwork(conf)
     model.init()
-    model.setListeners(new ScoreIterationListener(10))
+
+    // Add custom listener for monitoring
+    val listener = new CustomTrainingListener
+    model.setListeners(listener, new GradientNormListener(10), new EvaluativeListener(validationIterator, 1))
+
     model
   }
 
-  def preprocessInput(input: String, df: DataFrame): Array[Row] = {
-    val words = input.toLowerCase.split("\\s+")
-    words.map { word =>
-      try {
-        df.filter(df("word") === word).head
-      } catch {
-        case e: Exception =>
-          println(s"Warning: Word '$word' not found in vocabulary, using random word instead")
-          df.take(1).head
+  def createValidationDataSetIterator(validationDataRDD: RDD[String], tokenizer: SimpleTokenizer): DataSetIterator = {
+    // Process the validation data to create features and labels
+    val validationData = validationDataRDD.flatMap { text =>
+      val tokens = tokenizer.encode(text)
+      createSlidingWindows(tokens).map { case (inputSeq, label) =>
+        val inputArray = Nd4j.zeros(1, embeddingSize * windowSize)
+        val labelArray = Nd4j.zeros(1, vocabularySize)
+
+        // Convert input sequence and label to ND4J arrays
+        val embedding = createEmbeddingMatrix(inputSeq)
+        val attentionOutput = selfAttention(embedding)
+        val flattenedAttention = attentionOutput.reshape(1, embeddingSize * windowSize)
+        inputArray.putRow(0, flattenedAttention)
+        labelArray.putScalar(Array(0, label), 1.0)
+
+        new DataSet(inputArray, labelArray)
       }
-    }
+    }.collect().toList.asJava
+
+    // Create a ListDataSetIterator with a batch size of 1 (or adjust as needed)
+    new ListDataSetIterator(validationData, batchSize)
   }
 
-  def findTopKNeighbors(prediction: INDArray, df: DataFrame, k: Int): Array[Row] = {
-    val predictionArray = new Array[Double](prediction.length().toInt)
-    for (i <- 0 until prediction.length().toInt) {
-      predictionArray(i) = prediction.getDouble(i.toLong)
-    }
-    val predVector = Vectors.dense(predictionArray)
+  // Modify the train method to use serialization
+  def train(sc: SparkContext, textRDD: RDD[String], epochs: Int): MultiLayerNetwork = {
+    val tokenizer = new SimpleTokenizer()
+    val allTexts = textRDD.collect()
+    tokenizer.fit(allTexts)
+    val broadcastTokenizer = sc.broadcast(tokenizer)
 
-    val rows = df.collect()
-    rows.map { row =>
-        val embedding = row.getAs[Vector]("embedding")
-        (row, Vectors.sqdist(predVector, embedding))
-      }
-      .sortBy(_._2)
-      .take(k)
-      .map(_._1)
-  }
+    // Inside `train` method, split textRDD into training and validation sets
+    val Array(trainingDataRDD, validationDataRDD) = textRDD.randomSplit(Array(0.8, 0.2))
 
-  def generateText(model: MultiLayerNetwork,
-                   df: DataFrame,
-                   inputSentence: String,
-                   vocabulary: Seq[String],
-                   numWords: Int,
-                   temperature: Double = 0.8): String = {
+    // Generate validation DataSetIterator
+    val validationDataSetIterator = createValidationDataSetIterator(validationDataRDD, tokenizer)
 
-    val embeddingDim = df.first().getAs[Vector]("embedding").size
-    val positionalEmbeddings = computePositionalEmbedding(windowSize, embeddingDim)
-    val generated = ArrayBuffer[String]()
+    val model = buildModel(validationDataSetIterator)
+    var currentModelBytes = serializeModel(model)
+    var broadcastModel = sc.broadcast(currentModelBytes)
 
-    var currentWindow = preprocessInput(inputSentence, df).takeRight(windowSize).toBuffer
-    val usedWords = MutableSet[String]()
-    inputSentence.toLowerCase.split("\\s+").foreach(usedWords.add)
+    val batchProcessedAcc = sc.longAccumulator("batchesProcessed")
+    val totalLossAcc = sc.doubleAccumulator("totalLoss")
+    val correctPredictionsAcc = sc.longAccumulator("correctPredictions")
+    val totalPredictionsAcc = sc.longAccumulator("totalPredictions")
 
-    val random = new Random()
+    for (epoch <- 1 to epochs) {
+      val epochStartTime = System.currentTimeMillis()
+      println(s"Starting epoch $epoch")
 
-    for (_ <- 1 to numWords) {
-      val inputEmbeddings = currentWindow.map(_.getAs[Vector]("embedding"))
-      val positionAwareEmbeddings = inputEmbeddings.zip(positionalEmbeddings).map {
-        case (wordEmb, posEmb) =>
-          val combined = (wordEmb.toArray, posEmb.toArray).zipped.map(_ + _)
-          Vectors.dense(combined)
-      }
+      batchProcessedAcc.reset()
+      totalLossAcc.reset()
+      correctPredictionsAcc.reset()
+      totalPredictionsAcc.reset()
 
-      val inputArray = Nd4j.create(positionAwareEmbeddings.flatMap(_.toArray).toArray)
-      val reshapedInput = inputArray.reshape(1, windowSize, embeddingDim)
+      val samplesRDD = trainingDataRDD.flatMap { text =>
+        val tokens = broadcastTokenizer.value.encode(text)
+        createSlidingWindows(tokens)
+      }.persist()
 
-      val attentionOutput = selfAttention(reshapedInput)
-      val flattenedInput = attentionOutput.reshape(1, windowSize * embeddingDim)
-      val prediction = model.output(flattenedInput)
+      val processedRDD = samplesRDD.mapPartitions { partition =>
+        val localModel = deserializeModel(broadcastModel.value)
+        val batchBuffer = new scala.collection.mutable.ArrayBuffer[(Seq[Int], Int)]()
+        var localLoss = 0.0
+        var localCorrect = 0L
+        var localTotal = 0L
 
-      val K = 10
-      val candidates = findTopKNeighbors(prediction, df, K)
-        .map(_.getAs[String]("word"))
-        .filter(word => !usedWords.contains(word))
-
-      if (candidates.nonEmpty) {
-        val selectedWord = candidates(random.nextInt(candidates.length))
-        generated += selectedWord
-        usedWords.add(selectedWord)
-        currentWindow = currentWindow.tail :+ df.filter(df("word") === selectedWord).head
-      } else {
-        val randomWord = vocabulary(random.nextInt(vocabulary.size))
-        generated += randomWord
-        currentWindow = currentWindow.tail :+ df.filter(df("word") === randomWord).head
-      }
-    }
-
-    generated.mkString(" ")
-  }
-
-  def trainModel(df: DataFrame): (MultiLayerNetwork, Int) = {
-    val embeddingDim = df.first().getAs[Vector]("embedding").size
-    val positionalEmbeddings = computePositionalEmbedding(windowSize, embeddingDim)
-
-    val rows = df.collect()
-    val slidingWindows = rows.sliding(windowSize + 1).flatMap { window =>
-      if (window.length == windowSize + 1) {
-        val inputEmbeddings = window.take(windowSize).map(_.getAs[Vector]("embedding"))
-        val positionAwareEmbeddings = inputEmbeddings.zip(positionalEmbeddings).map {
-          case (wordEmb, posEmb) =>
-            val combined = (wordEmb.toArray, posEmb.toArray).zipped.map(_ + _)
-            Vectors.dense(combined)
+        partition.foreach { sample =>
+          batchBuffer += sample
+          if (batchBuffer.size >= batchSize) {
+            val (loss, correct, total) = processBatch(localModel, batchBuffer.toSeq)
+            localLoss += loss
+            localCorrect += correct
+            localTotal += total
+            batchBuffer.clear()
+            batchProcessedAcc.add(1)
+          }
         }
 
-        val targetEmbedding = window.last.getAs[Vector]("embedding")
-        val input = Nd4j.create(positionAwareEmbeddings.flatMap(_.toArray).toArray)
-        val target = Nd4j.create(targetEmbedding.toArray)
+        if (batchBuffer.nonEmpty) {
+          val (loss, correct, total) = processBatch(localModel, batchBuffer.toSeq)
+          localLoss += loss
+          localCorrect += correct
+          localTotal += total
+          batchProcessedAcc.add(1)
+        }
 
-        Some(new DataSet(input, target))
-      } else None
-    }.toList
+        totalLossAcc.add(localLoss)
+        correctPredictionsAcc.add(localCorrect)
+        totalPredictionsAcc.add(localTotal)
 
-    val inputSize = windowSize * embeddingDim
-    val outputSize = embeddingDim
-    val model = createModel(inputSize, hiddenSize, outputSize)
-
-    println("Starting model training...")
-    for (epoch <- 0 until numEpochs) {
-      slidingWindows.grouped(batchSize).foreach { batch =>
-        val features = Nd4j.vstack(batch.map(_.getFeatures): _*)
-        val labels = Nd4j.vstack(batch.map(_.getLabels): _*)
-        model.fit(features, labels)
+        Iterator.single(serializeModel(localModel))
       }
-      println(s"Completed epoch $epoch")
+
+      val updatedModels = processedRDD.collect()
+      if (updatedModels.nonEmpty) {
+        val averagedModel = if (updatedModels.length > 1) {
+          val models = updatedModels.map(deserializeModel)
+          averageModels(models)
+        } else {
+          deserializeModel(updatedModels(0))
+        }
+
+        broadcastModel.destroy()
+        currentModelBytes = serializeModel(averagedModel)
+        broadcastModel = sc.broadcast(currentModelBytes)
+
+        val epochDuration = System.currentTimeMillis() - epochStartTime
+        val avgLoss = totalLossAcc.value / batchProcessedAcc.value
+        val accuracy = if (totalPredictionsAcc.value > 0) {
+          correctPredictionsAcc.value.toDouble / totalPredictionsAcc.value
+        } else 0.0
+
+        println(f"""
+                   |Epoch $epoch Statistics:
+                   |Duration: ${epochDuration}ms
+                   |Average Loss: $avgLoss%.4f
+                   |Accuracy: ${accuracy * 100}%.2f%%
+                   |Batches Processed: ${batchProcessedAcc.value}
+                   |Predictions Made: ${totalPredictionsAcc.value}
+                   |Memory Used: ${Runtime.getRuntime.totalMemory() - Runtime.getRuntime.freeMemory()}B
+          """.stripMargin)
+      }
+
+      samplesRDD.unpersist()
+      val epochEndTime = System.currentTimeMillis()
+      println(s"Time per Epoch: ${epochEndTime - epochStartTime} ms")
+
+      //differentiating between executor memory and driver memory.
+      val executorMemoryStatus = sc.getExecutorMemoryStatus.map { case (executor, (maxMemory, remainingMemory)) =>
+        s"$executor: Max Memory = $maxMemory, Remaining Memory = $remainingMemory"
+      }
+      println(s"Executor Memory Status:\n${executorMemoryStatus.mkString("\n")}")
+
     }
 
-    (model, embeddingDim)
+    deserializeModel(broadcastModel.value)
   }
 
+
+  private def processBatch(model: MultiLayerNetwork, batch: Seq[(Seq[Int], Int)]): (Double, Long, Long) = {
+    val inputArray = Nd4j.zeros(batch.size, embeddingSize * windowSize)
+    val labelsArray = Nd4j.zeros(batch.size, vocabularySize)
+
+    batch.zipWithIndex.foreach { case ((sequence, label), idx) =>
+      val embedding = createEmbeddingMatrix(sequence)
+      val attentionOutput = selfAttention(embedding)
+      val flattenedAttention = attentionOutput.reshape(1, embeddingSize * windowSize)
+      inputArray.putRow(idx, flattenedAttention)
+      labelsArray.putScalar(Array(idx, label), 1.0)
+    }
+
+    // Train on batch
+    model.fit(inputArray, labelsArray)
+
+    //    val learningRate = model.getConfig.ra.getLearningRate
+    //    println(s"Current Learning Rate: $learningRate")
+
+
+    // Calculate metrics
+    val output = model.output(inputArray)
+    val predictions = Nd4j.argMax(output, 1)
+    val labels = Nd4j.argMax(labelsArray, 1)
+    // Calculate the number of correct predictions
+    val correct = predictions.eq(labels).castTo(org.nd4j.linalg.api.buffer.DataType.INT32)
+      .sumNumber().longValue()
+
+    (model.score(), correct, batch.size)
+  }
+
+  private def averageModels(models: Array[MultiLayerNetwork]): MultiLayerNetwork = {
+    val firstModel = models(0)
+    if (models.length == 1) return firstModel
+
+    val params = models.map(_.params())
+    val avgParams = params.reduce((a, b) => a.add(b)).div(models.length)
+
+    val result = new MultiLayerNetwork(firstModel.getLayerWiseConfigurations)
+    result.init()
+    result.setParams(avgParams)
+    result
+  }
+
+  /// Modified text generation with temperature sampling
+  def generateText(model: MultiLayerNetwork, tokenizer: SimpleTokenizer, seedText: String, length: Int, temperature: Double = 0.7): String = {
+    var currentSequence = tokenizer.encode(seedText).takeRight(windowSize)
+    val generated = new ArrayBuffer[Int]()
+    val rand = new Random()
+
+    def sampleWithTemperature(logits: INDArray, temp: Double): Int = {
+      val scaled = logits.div(temp)
+      val expScaled = Transforms.exp(scaled)
+      val probs = expScaled.div(expScaled.sum(1))
+
+      // Convert to probabilities and sample
+      val probArray = Array.ofDim[Double](probs.columns())
+      for (i <- 0 until probs.columns()) {
+        probArray(i) = probs.getDouble(Long.box(i))
+      }
+
+      // Sample using cumulative probabilities
+      val cumSum = probArray.scanLeft(0.0)(_ + _).tail
+      val sample = rand.nextDouble()
+      cumSum.zipWithIndex.find(_._1 >= sample).map(_._2).getOrElse(0)
+    }
+
+    for (_ <- 1 to length) {
+      val embedding = createEmbeddingMatrix(currentSequence)
+      val attentionOutput = selfAttention(embedding)
+      val flattenedAttention = attentionOutput.reshape(1, embeddingSize * windowSize)
+
+      val output = model.output(flattenedAttention)
+      val nextTokenIndex = sampleWithTemperature(output, temperature)
+
+      generated += nextTokenIndex
+      currentSequence = (currentSequence.tail :+ nextTokenIndex).takeRight(windowSize)
+    }
+
+    tokenizer.decode(generated)
+  }
+
+  def getSparkConf(): SparkConf = {
+    new SparkConf()
+      .setAppName("DistributedLanguageModel")
+      .setMaster("local[*]")
+      .set("spark.executor.memory", "4g")
+      .set("spark.driver.memory", "4g")
+      .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+      .set("spark.kryoserializer.buffer.max", "512m")
+      .set("spark.kryoserializer.buffer", "256m")
+      .registerKryoClasses(Array(
+        classOf[MultiLayerNetwork],
+        classOf[INDArray],
+        classOf[Array[Byte]],
+        classOf[org.nd4j.linalg.api.buffer.DataBuffer]
+      ))
+  }
+
+  class GradientNormListener(logFrequency: Int) extends IterationListener {
+    private var iteration = 0
+
+    //  override def invoked(): Boolean = true
+
+    //  override def invoke(): Unit = {}
+
+    override def iterationDone(model: Model, iteration: Int, epoch: Int): Unit = {
+      if (iteration % logFrequency == 0) {
+        // Get the gradients
+        val gradients: INDArray = model.gradient().gradient()
+
+        val gradientMean = gradients.meanNumber().doubleValue()
+        val gradientMax = gradients.maxNumber().doubleValue()
+        val gradientMin = gradients.minNumber().doubleValue()
+        println(s"Iteration $iteration: Gradient Mean = $gradientMean, Max = $gradientMax, Min = $gradientMin")
+      }
+    }
+  }
+
+}
+
+object SimpleLanguageModel {
   def main(args: Array[String]): Unit = {
-    val spark = SparkSession.builder()
-      .appName("TextGenerator")
-      .master("local[*]")
-      .getOrCreate()
+    // Configure Spark with appropriate resources
+    val model = new SentenceGenerationImpl()
+    val sc = new SparkContext(model.getSparkConf())
 
     try {
-      spark.sparkContext.setLogLevel("ERROR")
+      // Enable logging
+      sc.setLogLevel("INFO")
 
-      println("Loading vocabulary...")
-      val vocabulary = loadVocabulary(vocabularyPath)
-
-      println("Loading embeddings...")
-      val data = spark.sparkContext.textFile(embeddingsPath)
+      val filePath = "/Users/niharikabelavadishekar/Documents/Cloud_Assignment/Homework2_LLM/src/main/resources/input/input.txt"
+      val textRDD = sc.textFile(filePath)
         .map(_.trim)
         .filter(_.nonEmpty)
+        .cache()
 
-      val parsedRows = data.map { line =>
-        try {
-          val parts = line.split("\\s+", 3)
-          if (parts.length == 3) {
-            val word = parts(0)
-            val tokenId = parts(1).toInt
-            val embeddingStr = parts(2).stripPrefix("[").stripSuffix("]")
-            val embedding = Vectors.dense(
-              embeddingStr.split(",").map(_.trim).filter(_.nonEmpty).map(_.toDouble)
-            )
-            Some(Row(word, tokenId, embedding))
-          } else None
-        } catch {
-          case e: Exception =>
-            println(s"Error parsing line: $line - ${e.getMessage}")
-            None
-        }
-      }.filter(_.isDefined).map(_.get)
+      // Print initial statistics
+      println(s"Number of partitions: ${textRDD.getNumPartitions}")
+      println(s"Total number of lines: ${textRDD.count()}")
 
-      val schema = StructType(Seq(
-        StructField("word", StringType, true),
-        StructField("tokenId", IntegerType, true),
-        StructField("embedding", VectorType, true)
-      ))
+      val trainedModel = model.train(sc, textRDD, 10)
 
-      val df = spark.createDataFrame(parsedRows, schema).cache()
+      // Generate sample text
+      val tokenizer = new model.SimpleTokenizer()
+      val texts = textRDD.collect()
+      tokenizer.fit(texts)
 
-      println("Training model...")
-      val (model, embeddingDim) = trainModel(df)
+      val generatedText = model.generateText(trainedModel, tokenizer, "One morning", 50)
+      val cleanedText = generatedText.replaceAll("\\s+", " ")
+      println(s"Generated text: $cleanedText")
+      println(s"Generated text: $generatedText")
 
-      println("\nGenerating text...")
-      val generatedText = generateText(model, df, inputText, vocabulary, 10)
-
-      println(s"\nInput: $inputText")
-      println(s"Generated continuation: $generatedText")
-
-      // Save model
-      val modelPath = "trained_model.zip"
-      ModelSerializer.writeModel(model, new File(modelPath), true)
-      println(s"\nModel saved to $modelPath")
-
-    } catch {
-      case e: Exception =>
-        println(s"Application error: ${e.getMessage}")
-        e.printStackTrace()
     } finally {
-      spark.stop()
+      sc.stop()
     }
   }
 }
