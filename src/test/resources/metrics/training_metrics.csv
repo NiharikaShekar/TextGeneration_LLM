@@ -1,0 +1,2 @@
+Epoch,LearningRate,Loss,Accuracy,BatchesProcessed,PredictionsMade,EpochDuration,NumberOfPartitions,NumberOfLines,MemoryUsed
+1,0.005,0.5,75.0,100,1000,5000,4,1000,1GB
