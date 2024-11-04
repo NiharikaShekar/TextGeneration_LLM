@@ -2,9 +2,10 @@
 import com.typesafe.config.{Config, ConfigFactory}
 import java.io._
 import org.slf4j.LoggerFactory
+import org.apache.spark.{SparkConf, SparkContext}
 
 // This is used to manage configuration settings for a specified environment
-class ConfigurationManager(environment: String) extends Serializable {
+class ConfigurationManager(val environment: String) extends Serializable {
   private val logger = LoggerFactory.getLogger(getClass)
 
   logger.info(s"Initializing ConfigurationManager for environment: $environment")
@@ -41,24 +42,67 @@ class ConfigurationManager(environment: String) extends Serializable {
   val outputPath: String = config.getString("paths.output")
   val metricsPath: String = config.getString("paths.metrics")
 
+  // Helper method to check if a path is S3 path
+  def isS3Path(path: String): Boolean = path.startsWith("s3://")
+
+  // Helper method to get base path for creating directories
+  def getBasePath(path: String): String = {
+    val lastSlashIndex = path.lastIndexOf("/")
+    if (lastSlashIndex > 0) path.substring(0, lastSlashIndex)
+    else path
+  }
+
   logger.info("Path configurations loaded successfully")
   logger.debug(s"Input Path: $inputPath, Sample Path: $samplePath")
   logger.debug(s"Output Path: $outputPath, Metrics Path: $metricsPath")
 }
 
 // This handles file operations such as reading, writing, and metrics tracking
-class FileHandler(config: ConfigurationManager) extends Serializable {
+class FileHandler(config: ConfigurationManager, sc: SparkContext) extends Serializable {
   private val logger = LoggerFactory.getLogger(getClass)
+  private val environment = config.environment
 
-  // Reading the seed text which is given by the user and is used to generate further text
-  def readSampleWord(): String = {
-    logger.info(s"Attempting to read sample word from ${config.samplePath}")
+  // Helper method to create S3 directory structure
+  private def createS3Directory(path: String): Unit = {
+    logger.info(s"Creating S3 directory structure for path: $path")
+    val rdd = sc.emptyRDD[String]
     try {
-      val source = scala.io.Source.fromFile(config.samplePath)
-      val word = source.mkString.trim
-      source.close()
-      logger.debug(s"Successfully read sample word: $word")
-      word
+      rdd.coalesce(1).saveAsTextFile(path)
+      logger.debug(s"Successfully created S3 directory: $path")
+    } catch {
+      case e: Exception =>
+        logger.error(s"Error creating S3 directory: ${e.getMessage}", e)
+    }
+  }
+
+  // Helper method to write data to S3
+  private def writeToS3(path: String, data: String): Unit = {
+    logger.info(s"Writing data to S3 path: $path")
+    try {
+      val dataRdd = sc.parallelize(Seq(data))
+      dataRdd.coalesce(1).saveAsTextFile(path)
+      logger.debug(s"Successfully wrote data to S3: $path")
+    } catch {
+      case e: Exception =>
+        logger.error(s"Error writing to S3: ${e.getMessage}", e)
+    }
+  }
+
+  // Reading the seed text with support for both local and S3
+  def readSampleWord(): String = {
+    logger.info(s"Reading sample word from ${config.samplePath}")
+
+    try {
+      if (environment == "emr") {
+        // S3 reading using Spark
+        sc.textFile(config.samplePath).collect().mkString(" ").trim
+      } else {
+        // Local file reading
+        val source = scala.io.Source.fromFile(config.samplePath)
+        val word = source.mkString.trim
+        source.close()
+        word
+      }
     } catch {
       case e: Exception =>
         logger.error(s"Error reading sample word: ${e.getMessage}", e)
@@ -67,13 +111,20 @@ class FileHandler(config: ConfigurationManager) extends Serializable {
     }
   }
 
-  // This writes the generated text to an output file
+  // Writing generated text with support for both local and S3
   def writeGeneratedText(text: String): Unit = {
-    logger.info(s"Attempting to write generated text to ${config.outputPath}")
+    logger.info(s"Writing generated text to ${config.outputPath}")
+
     try {
-      val writer = new PrintWriter(config.outputPath)
-      writer.write(text)
-      writer.close()
+      if (environment == "emr") {
+        // S3 writing
+        writeToS3(config.outputPath, text)
+      } else {
+        // Local file writing
+        val writer = new PrintWriter(config.outputPath)
+        writer.write(text)
+        writer.close()
+      }
       logger.debug(s"Successfully wrote ${text.length} characters to output file")
     } catch {
       case e: Exception =>
@@ -81,16 +132,55 @@ class FileHandler(config: ConfigurationManager) extends Serializable {
     }
   }
 
-  // This creates a writer for metrics logging with a pre-defined header
-  def createMetricsWriter(): BufferedWriter = {
+  // Creating metrics writer with support for both local and S3
+  def createMetricsWriter(): MetricsWriter = {
     logger.info(s"Creating metrics writer for ${config.metricsPath}")
-    val file = new File(config.metricsPath)
-    file.getParentFile.mkdirs() // Ensure directories exist
-    logger.debug("Created parent directories for metrics file")
 
-    val writer = new BufferedWriter(new FileWriter(file))
-    writer.write("Epoch,\tLearningRate,\tLoss,\tAccuracy,\tBatchesProcessed,\tPredictionsMade,\tEpochDuration,\tNumber of partitions,\tNumber Of Lines,\tMemoryUsed\n")
-    logger.debug("Initialized metrics file with header")
-    writer
+    if (environment == "emr") {
+      new S3MetricsWriter(config.metricsPath, sc)
+    } else {
+      new LocalMetricsWriter(config.metricsPath)
+    }
+  }
+}
+
+// Abstract trait for metrics writing
+trait MetricsWriter {
+  def write(line: String): Unit
+  def close(): Unit
+}
+
+// Implementation for local file system
+class LocalMetricsWriter(path: String) extends MetricsWriter {
+  private val writer = {
+    val file = new File(path)
+    file.getParentFile.mkdirs()
+    val w = new BufferedWriter(new FileWriter(file))
+    w.write("Epoch,LearningRate,Loss,Accuracy,BatchesProcessed,PredictionsMade,EpochDuration,NumberOfPartitions,NumberOfLines,MemoryUsed\n")
+    w
+  }
+
+  def write(line: String): Unit = {
+    writer.write(line)
+    writer.flush()
+  }
+
+  def close(): Unit = {
+    writer.close()
+  }
+}
+
+// Implementation for S3
+class S3MetricsWriter(path: String, sc: SparkContext) extends MetricsWriter {
+  private val buffer = new StringBuilder()
+  buffer.append("Epoch,LearningRate,Loss,Accuracy,BatchesProcessed,PredictionsMade,EpochDuration,NumberOfPartitions,NumberOfLines,MemoryUsed\n")
+
+  def write(line: String): Unit = {
+    buffer.append(line)
+  }
+
+  def close(): Unit = {
+    val dataRdd = sc.parallelize(Seq(buffer.toString()))
+    dataRdd.coalesce(1).saveAsTextFile(path)
   }
 }

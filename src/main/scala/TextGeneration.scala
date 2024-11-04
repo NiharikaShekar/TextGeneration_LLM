@@ -18,6 +18,7 @@ import org.nd4j.linalg.lossfunctions.LossFunctions
 import org.nd4j.linalg.schedule.{ExponentialSchedule, ScheduleType}
 import org.nd4j.linalg.ops.transforms.Transforms
 
+
 import java.io.{BufferedWriter, ByteArrayInputStream, ObjectInputStream, ObjectOutputStream}
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
@@ -217,8 +218,8 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
   }
 
   // Training the model for text generation
-  def train(sc: SparkContext, textRDD: RDD[String], metricsWriter: BufferedWriter): MultiLayerNetwork = {
-    logger.info(s"Starting training for $config.epochs epochs")
+  def train(sc: SparkContext, textRDD: RDD[String], metricsWriter: MetricsWriter): MultiLayerNetwork = {
+    logger.info(s"Starting training for ${config.epochs} epochs")
     val tokenizer = new SimpleTokenizer()
     val allTexts = textRDD.collect()
     tokenizer.fit(allTexts)
@@ -337,8 +338,9 @@ class TextGeneration(config: ConfigurationManager) extends Serializable {
         }
 
         // Now, we write this metrics to a CSV file
-        metricsWriter.write(f"$epoch,$learningRate%.6f,$avgLoss%.4f,${accuracy * 100}%.2f,${batchProcessedAcc.value},${totalPredictionsAcc.value},$epochDuration,${textRDD.getNumPartitions},${textRDD.count()},,${executorMemoryStatus.mkString("\n")}\n")
-      }
+        metricsWriter.write(
+          f"$epoch,$learningRate%.6f,$avgLoss%.4f,${accuracy * 100}%.2f,${batchProcessedAcc.value},${totalPredictionsAcc.value},$epochDuration,${textRDD.getNumPartitions},${textRDD.count()},,${executorMemoryStatus.mkString("\n")}\n"
+        )}
       logger.info(s"Epoch $epoch completed")
       samplesRDD.unpersist()
     }
@@ -414,12 +416,14 @@ object Text_Generation {
   def main(args: Array[String]): Unit = {
     val environment = if (args.isEmpty) "local" else args(0)
     val config = new ConfigurationManager(environment)
-    val fileHandler = new FileHandler(config)
     val model = new TextGeneration(config)
 
     // Creating a Spark context with the specified configuration
     val sc = new SparkContext(model.getSparkConf())
     sc.setLogLevel("INFO")
+
+    // Create FileHandler with SparkContext
+    val fileHandler = new FileHandler(config, sc)
     val metricsWriter = fileHandler.createMetricsWriter()
 
     try {

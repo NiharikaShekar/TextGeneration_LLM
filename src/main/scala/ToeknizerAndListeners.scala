@@ -5,6 +5,7 @@ import org.nd4j.linalg.api.ndarray.INDArray
 import org.deeplearning4j.optimize.api._
 import org.slf4j.LoggerFactory
 
+
 // This is a tokenizer that converts words to indices and vice versa
 class SimpleTokenizer extends Serializable {
   private val logger = LoggerFactory.getLogger(getClass)
