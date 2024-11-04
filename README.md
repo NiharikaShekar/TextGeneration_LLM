@@ -21,7 +21,7 @@ The text generation is achieved using a sliding window approach along with vecto
 6. **Flattening and Model Training**: The output is flattened to ensure the correct input format. The model is then trained with this data over a specified number of epochs. After training, the model is validated to assess accuracy, loss, and memory usage.
 7. **Text Prediction**: The trained model can predict the next sequence of text based on the seed input using Spark.
 
-For a visual overview of the project, please check out the [YouTube Link](https://youtu.be/i7NDoDv3N2s).
+For a visual overview of the project, please check out the [YouTube Link](https://youtu.be/o4kjQ91r0mM).
 
 ## Prerequisites
 To successfully run the project, ensure the following prerequisites are met (the operating system used is macOS):
